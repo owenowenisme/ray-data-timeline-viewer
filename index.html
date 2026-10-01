@@ -64,6 +64,7 @@
   .oprow { display: flex; border-bottom: 1px solid var(--hairline); }
   .oprow:last-child { border-bottom: none; }
   .oplabel {
+    position: relative;
     flex: 0 0 300px; border-right: 1px solid var(--hairline);
     padding: calc(7px * var(--vs)) 10px calc(7px * var(--vs)) 12px;
     background: var(--surface); cursor: pointer;
@@ -138,6 +139,14 @@
   }
   #inspector button:hover { color: var(--ink); }
   .oplabel .guide { color: var(--ink-3); }
+  .chainstrip {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 12px;
+    display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+  }
+  .chainstrip > span { grid-area: 1 / 1 / 3 / 3; }
+  .chainstrip.joint > .in-a { grid-area: 1 / 1 / 2 / 2; }
+  .chainstrip.joint > .in-b { grid-area: 2 / 1 / 3 / 2; }
+  .chainstrip.joint > .out { grid-area: 1 / 2 / 3 / 3; }
   #rails {
     position: absolute; top: 0; left: 0; z-index: 2; pointer-events: none;
     overflow: visible;
@@ -459,6 +468,30 @@ function render(data) {
     op._depth = (data.ops[c]._depth || 0) + (i === primary ? 0 : 1);
   }
   const hasEdges = data.ops.some((op) => (op.inputs || []).length);
+  // Chain coloring: operators on the same unbranched straight-line segment
+  // share a color; a joint (multi-input op) starts a new downstream color and
+  // its strip shows the merge: left half = the two incoming chain colors,
+  // right half = the new outgoing color.
+  let nextChain = 0;
+  data.ops.forEach((op, i) => {
+    const ins = op.inputs || [];
+    if (ins.length === 1 && (data.ops[ins[0]].consumers || []).length === 1) {
+      op._chain = data.ops[ins[0]]._chain;
+    } else {
+      op._chain = nextChain++;
+    }
+  });
+  const chainColor = (k) => `hsl(${(k * 137.508 + 40) % 360} 62% 52%)`;
+  const stripHtml = (op) => {
+    const ins = op.inputs || [];
+    if (ins.length >= 2) {
+      return `<span class="chainstrip joint">` +
+        `<span class="in-a" style="background:${chainColor(data.ops[ins[0]]._chain)}"></span>` +
+        `<span class="in-b" style="background:${chainColor(data.ops[ins[1]]._chain)}"></span>` +
+        `<span class="out" style="background:${chainColor(op._chain)}"></span></span>`;
+    }
+    return `<span class="chainstrip"><span style="background:${chainColor(op._chain)}"></span></span>`;
+  };
   const nTasks = data.ops.reduce((a, o) => a + o.tasks.length, 0);
   document.getElementById("meta").textContent =
     (loadedName ? `${loadedName}: ` : "") +
@@ -486,8 +519,8 @@ function render(data) {
     row.className = "oprow";
     const indent = hasEdges ? Math.min(op._depth || 0, 10) * 16 : 0;
     row.innerHTML =
-      `<div class="oplabel" title="${op.name}" style="padding-left:${14 + indent}px">` +
-      `<span class="chev">▸</span>${op.name}</div>` +
+      `<div class="oplabel" title="${op.name}" style="padding-left:${22 + indent}px">` +
+      `${hasEdges ? stripHtml(op) : ""}<span class="chev">▸</span>${op.name}</div>` +
       `<div class="optrack"></div>`;
     op._group = group;
     const opEls = [];
@@ -510,7 +543,8 @@ function render(data) {
     lanesRow.className = "oprow lanesrow";
     const laneH = 11;
     lanesRow.innerHTML =
-      `<div class="oplabel">${op.tasks.length} tasks · peak ${op.lanes}</div>` +
+      `<div class="oplabel" style="padding-left:${22 + indent}px">` +
+      `${hasEdges ? stripHtml(op) : ""}${op.tasks.length} tasks · peak ${op.lanes}</div>` +
       `<div class="lanes" style="height:calc(${op.lanes * laneH + 6}px * var(--vs))"></div>`;
     const lanes = lanesRow.querySelector(".lanes");
     for (const t of op.tasks) {
@@ -580,7 +614,7 @@ function drawRails() {
     const r = op._group.querySelector(".oprow").getBoundingClientRect();
     return r.top - chartTop + r.height / 2;
   };
-  const xOf = (op) => 8 + Math.min(op._depth || 0, 10) * 16;
+  const xOf = (op) => 18 + Math.min(op._depth || 0, 10) * 16;
   let d = [];
   for (const op of DATA.ops) {
     for (const ci of op.consumers || []) {
