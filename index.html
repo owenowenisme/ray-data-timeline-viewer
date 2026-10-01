@@ -493,12 +493,17 @@ function render(data) {
     return `<span class="chainstrip"><span style="background:${chainColor(op._chain)}"></span></span>`;
   };
   const nTasks = data.ops.reduce((a, o) => a + o.tasks.length, 0);
+  const degraded = hasEdges && nextChain <= 1 && data.ops.length > 2;
   document.getElementById("meta").textContent =
     (loadedName ? `${loadedName}: ` : "") +
     `${fmtS(data.duration)} wall clock across ${data.ops.length} operators and ` +
     `${nTasks} tasks. Click an operator to expand its tasks and a bar to ` +
     "focus it; pinch or ctrl+scroll to zoom time, alt+scroll to zoom row " +
-    "heights, drag to pan, double-click to reset.";
+    "heights, drag to pan, double-click to reset." +
+    (degraded
+      ? " Note: this trace carries no operator-branch information (exported " +
+        "by an older Ray), so chain colors and hierarchy are approximate."
+      : "");
   document.getElementById("legend").innerHTML = Object.values(ROLES).map(
     ([label, color]) => `<span><span class="swatch" style="background:${color}"></span>${label}</span>`
   ).join("");
@@ -564,7 +569,10 @@ function render(data) {
     }
     group.appendChild(lanesRow);
 
-    row.querySelector(".oplabel").addEventListener("click", () => {
+    const label = row.querySelector(".oplabel");
+    label.addEventListener("mousemove", (ev) => showTip(detailsHtml(opDetails(op)), ev));
+    label.addEventListener("mouseleave", hideTip);
+    label.addEventListener("click", () => {
       group.classList.toggle("open");
       drawRails();
     });
