@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ray Data execution timeline</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --surface: #fcfcfb; --surface-2: #f3f2ef;
+    --ink: #0b0b0b; --ink-2: #52514e; --ink-3: #8a897f;
+    --hairline: #e4e3de; --grid: #ecebe6;
+    --c-read: #2a78d6; --c-transform: #eb6834; --c-shufmap: #1baf7a;
+    --c-shufreduce: #e87ba4; --c-output: #eda100;
+    --tooltip-bg: #1f1f1d; --tooltip-ink: #f5f4ef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface: #1a1a19; --surface-2: #232322;
+      --ink: #ffffff; --ink-2: #c3c2b7; --ink-3: #85847a;
+      --hairline: #333330; --grid: #262624;
+      --c-read: #3987e5; --c-transform: #d95926; --c-shufmap: #199e70;
+      --c-shufreduce: #d55181; --c-output: #c98500;
+      --tooltip-bg: #f5f4ef; --tooltip-ink: #1f1f1d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--surface); color: var(--ink); margin: 0;
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; padding: 24px 24px 64px; }
+  h1 { font-size: 20px; font-weight: 650; margin: 0 0 4px; }
+  .sub { color: var(--ink-2); font-size: 13px; margin: 0 0 14px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 0 0 14px; font-size: 12px; color: var(--ink-2); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; }
+
+  /* --vs is the vertical zoom factor; every row dimension derives from it. */
+  .chart { --vs: 1; position: relative; border: 1px solid var(--hairline); border-radius: 10px; overflow: hidden; }
+  .chart.dropping { outline: 2px dashed var(--c-read); outline-offset: -2px; }
+  .axis {
+    position: sticky; top: 0; z-index: 3; display: flex; height: 26px;
+    background: var(--surface-2); border-bottom: 1px solid var(--hairline);
+    font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: var(--ink-3);
+  }
+  .axis .label-pad { flex: 0 0 300px; border-right: 1px solid var(--hairline); }
+  .axis .ticks { position: relative; flex: 1; overflow: hidden; }
+  .axis .tick { position: absolute; top: 5px; transform: translateX(-50%); white-space: nowrap; }
+
+  #grid { position: absolute; top: 26px; bottom: 0; left: 300px; right: 0; z-index: 0; pointer-events: none; }
+  .gridline { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--grid); }
+
+  #cross { position: absolute; top: 0; bottom: 0; left: 300px; right: 0; z-index: 2; pointer-events: none; display: none; }
+  #crossline { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--ink-3); opacity: 0.65; }
+  #crosslabel {
+    position: absolute; top: 30px; transform: translateX(-50%);
+    background: var(--tooltip-bg); color: var(--tooltip-ink);
+    font-family: ui-monospace, Menlo, monospace; font-size: 10.5px;
+    padding: 1px 6px; border-radius: 4px; white-space: nowrap;
+  }
+
+  #rows { position: relative; z-index: 1; }
+  .oprow { display: flex; border-bottom: 1px solid var(--hairline); }
+  .oprow:last-child { border-bottom: none; }
+  .oplabel {
+    flex: 0 0 300px; border-right: 1px solid var(--hairline);
+    padding: calc(7px * var(--vs)) 10px calc(7px * var(--vs)) 12px;
+    background: var(--surface); cursor: pointer;
+    font-family: ui-monospace, Menlo, monospace; color: var(--ink);
+    font-size: clamp(8px, calc(11.5px * var(--vs)), 13px);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .oplabel:hover { background: var(--surface-2); }
+  .oplabel .chev { display: inline-block; width: 12px; color: var(--ink-3); transition: transform 0.12s; }
+  .oprow-group.open .chev { transform: rotate(90deg); }
+  .optrack { position: relative; flex: 1; min-height: calc(32px * var(--vs)); overflow: hidden; cursor: grab; }
+  .optrack:active { cursor: grabbing; }
+
+  .opbar {
+    position: absolute; top: calc(5px * var(--vs)); height: calc(22px * var(--vs));
+    border-radius: 5px; overflow: hidden; min-width: 2px;
+  }
+  .opbar svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .lanesrow { display: none; }
+  .oprow-group.open .lanesrow { display: flex; }
+  .lanesrow .oplabel { color: var(--ink-3); font-size: 10.5px; cursor: default; }
+  .lanesrow .oplabel:hover { background: var(--surface); }
+  .lanes { position: relative; flex: 1; overflow: hidden; cursor: grab; }
+  .task { position: absolute; height: calc(9px * var(--vs)); border-radius: 2px; min-width: 1.5px; }
+  .task:hover { outline: 1px solid var(--ink); }
+
+  #tooltip {
+    position: fixed; display: none; z-index: 10; pointer-events: none;
+    background: var(--tooltip-bg); color: var(--tooltip-ink);
+    border-radius: 7px; padding: 8px 11px; font-size: 12px; line-height: 1.5;
+    font-family: ui-monospace, Menlo, monospace; max-width: 380px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  }
+  #tooltip .t { font-weight: 700; overflow-wrap: break-word; }
+  #tooltip .r { display: flex; justify-content: space-between; gap: 18px; }
+  #tooltip .r span:first-child { opacity: 0.72; }
+  #tooltip .r span:last-child { overflow-wrap: anywhere; text-align: right; }
+  #empty { padding: 60px 20px; text-align: center; color: var(--ink-3); cursor: pointer; }
+  #empty:hover { color: var(--ink-2); }
+
+  .toolbar { display: flex; align-items: flex-start; gap: 12px; margin: 0 0 14px; }
+  .toolbar .legend { margin: 0; flex: 1; }
+  .toolbar button {
+    font: 12px ui-monospace, Menlo, monospace; color: var(--ink-2); white-space: nowrap;
+    background: var(--surface-2); border: 1px solid var(--hairline); border-radius: 6px;
+    padding: 4px 12px; cursor: pointer;
+  }
+  .toolbar button:hover { color: var(--ink); }
+
+  .opbar, .task { cursor: pointer; }
+  /* Focus mode: everything dims except the clicked object (f-keep) and its
+     operator's other bars (f-rel). */
+  #rows.focus .opbar, #rows.focus .task { opacity: 0.15; }
+  #rows.focus .f-rel { opacity: 0.55; }
+  #rows.focus .f-keep { opacity: 1; }
+
+  #inspector {
+    position: fixed; right: 16px; top: 16px; width: 380px; z-index: 9; display: none;
+    background: var(--surface-2); border: 1px solid var(--hairline); border-radius: 10px;
+    padding: 12px 14px; box-shadow: 0 6px 24px rgba(0,0,0,0.25);
+    font-family: ui-monospace, Menlo, monospace; user-select: text; cursor: text;
+  }
+  #inspector .t { font-weight: 700; font-size: 12px; margin: 0 56px 6px 0; overflow-wrap: anywhere; }
+  #inspector .r { display: flex; justify-content: space-between; gap: 14px; font-size: 11.5px; padding: 1px 0; }
+  #inspector .r span:first-child { color: var(--ink-3); flex: none; }
+  #inspector .r span:last-child { overflow-wrap: anywhere; text-align: right; }
+  #inspector .btns { position: absolute; top: 9px; right: 9px; display: flex; gap: 6px; }
+  #inspector button {
+    font: 11px ui-monospace, Menlo, monospace; color: var(--ink-2);
+    background: var(--surface); border: 1px solid var(--hairline); border-radius: 5px;
+    padding: 2px 8px; cursor: pointer;
+  }
+  #inspector button:hover { color: var(--ink); }
+  .oplabel .guide { color: var(--ink-3); }
+  /* Focused operator's direct relations: inputs dashed, consumers solid. */
+  .oplabel.rel-in { box-shadow: inset 3px 0 var(--ink-3); }
+  .oplabel.rel-out { box-shadow: inset 3px 0 var(--ink); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Ray Data execution timeline</h1>
+  <p class="sub" id="meta">Open a timeline JSON exported by
+    <code>Dataset.export_timeline</code>, or drop it anywhere on the chart.</p>
+  <div class="toolbar">
+    <div class="legend" id="legend"></div>
+    <button id="openbtn">Open trace…</button>
+    <input id="fileinput" type="file" accept=".json,.gz,application/json,application/gzip" hidden>
+  </div>
+  <div class="chart" id="chart"><div id="empty">No data loaded. Click to open a
+    timeline JSON (.json or .json.gz), or drop one here.</div></div>
+</div>
+<div id="tooltip"></div>
+<div id="inspector"></div>
+<script>
+const EMBEDDED = null;
+const ROLES = {
+  read: ["Read", "var(--c-read)"],
+  transform: ["Transform", "var(--c-transform)"],
+  shufmap: ["Shuffle map", "var(--c-shufmap)"],
+  shufreduce: ["Shuffle reduce", "var(--c-shufreduce)"],
+  output: ["Sort / limit / write", "var(--c-output)"],
+};
+const ROLE_PATTERNS = [
+  ["read", /ListFiles|ReadFiles|Read[A-Z]/],
+  ["shufmap", /ShuffleMap|HashAggregateMap|SortSample|RepartitionSplit/],
+  ["shufreduce", /ShuffleReduce|HashAggregateReduce|RepartitionReduce/],
+  ["output", /^Sort|^limit|^Write/],
+];
+const roleOf = (name) => (ROLE_PATTERNS.find(([, re]) => re.test(name)) || ["transform"])[0];
+
+const fmtS = (t) => t >= 100 ? t.toFixed(0) + " s" : t >= 1 ? t.toFixed(2) + " s" : (t * 1000).toFixed(0) + " ms";
+const fmtBytes = (b) => b >= 1 << 30 ? (b / (1 << 30)).toFixed(2) + " GiB"
+  : b >= 1 << 20 ? (b / (1 << 20)).toFixed(1) + " MiB"
+  : b >= 1024 ? (b / 1024).toFixed(1) + " KiB" : b + " B";
+
+// Accept either the compact embedded form ({ops, duration}) or a raw Chrome
+// trace from Dataset.export_timeline, so the trace JSON doubles as the
+// interchange format.
+function normalize(raw) {
+  if (!raw) return null;
+  if (raw.ops) return raw;
+  const evs = raw.traceEvents || (Array.isArray(raw) ? raw : null);
+  if (!evs) return null;
+  const names = {}, tasks = {}, counters = {}, edges = {};
+  for (const e of evs) {
+    if (e.name === "process_name") names[e.pid] = e.args.name;
+  }
+  for (const e of evs) {
+    if (e.ph === "X" && e.cat === "task") (tasks[e.pid] = tasks[e.pid] || []).push(e);
+    else if (e.ph === "X" && e.cat === "operator") edges[e.pid] = e.args.input_ops || [];
+    else if (e.ph === "C" && e.name === "running tasks")
+      (counters[e.pid] = counters[e.pid] || []).push([e.ts / 1e6, e.args.tasks]);
+  }
+  const keptPids = Object.keys(names).map(Number).sort((a, b) => a - b)
+    .filter((pid) => names[pid] !== "all operators" && tasks[pid]);
+  const pidToIdx = Object.fromEntries(keptPids.map((pid, i) => [pid, i]));
+  const ops = [];
+  for (const pid of keptPids) {
+    const name = names[pid].replace(/^\d+: /, "");
+    const ts = tasks[pid].map((e) => ({
+      idx: parseInt(e.name.split(" ").pop(), 10),
+      lane: e.tid,
+      s: e.ts / 1e6,
+      e: (e.ts + e.dur) / 1e6,
+      blocks: e.args.blocks,
+      rows: e.args.rows,
+      bytes: e.args.size_bytes,
+      cpu: e.args.cpu_s || 0,
+      node: e.args.node_id,
+    }));
+    ops.push({
+      name,
+      role: roleOf(name),
+      inputs: (edges[pid] || []).map((p) => pidToIdx[p]).filter((i) => i !== undefined),
+      t0: Math.min(...ts.map((t) => t.s)),
+      t1: Math.max(...ts.map((t) => t.e)),
+      busy: ts.reduce((a, t) => a + (t.e - t.s), 0),
+      cpu: ts.reduce((a, t) => a + t.cpu, 0),
+      rows: ts.reduce((a, t) => a + t.rows, 0),
+      bytes: ts.reduce((a, t) => a + t.bytes, 0),
+      lanes: Math.max(...ts.map((t) => t.lane)) + 1,
+      counter: (counters[pid] || []).sort((a, b) => a[0] - b[0]),
+      tasks: ts,
+    });
+  }
+  return { ops, duration: Math.max(...ops.map((o) => o.t1), 0) };
+}
+
+const LABELW = 300;  // keep in sync with the .oplabel / #grid CSS
+const tip = document.getElementById("tooltip");
+function showTip(html, ev) {
+  tip.innerHTML = html;
+  tip.style.display = "block";
+  let x = ev.clientX + 14, y = ev.clientY + 14;
+  const r = tip.getBoundingClientRect();
+  if (x + r.width > innerWidth - 8) x = ev.clientX - r.width - 14;
+  if (y + r.height > innerHeight - 8) y = ev.clientY - r.height - 14;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+const hideTip = () => (tip.style.display = "none");
+
+const chart = document.getElementById("chart");
+let DATA = null;
+// The visible time window; wheel zooms it around the cursor, drag pans it.
+let v0 = 0, v1 = 1;
+let positioned = [];  // {el, s, e} for every bar, repositioned on view change
+
+function pctIn(t) { return ((t - v0) / (v1 - v0)) * 100; }
+
+// One source of truth for an object's details, shared by the hover tooltip
+// and the pinned inspector; values are never truncated.
+function opDetails(op) {
+  const peak = Math.max(...op.counter.map((p) => p[1]), 0);
+  return {
+    title: op.name,
+    rows: [
+      ["span", `${fmtS(op.t0)} – ${fmtS(op.t1)} (${fmtS(op.t1 - op.t0)})`],
+      ["tasks", `${op.tasks.length}`],
+      ["peak running", `${peak}`],
+      ["task-busy", fmtS(op.busy)],
+      ...(op.cpu > 0
+        ? [["CPU time", `${fmtS(op.cpu)} (${((op.cpu / Math.max(op.busy, 1e-9)) * 100).toFixed(0)}% of busy)`]]
+        : []),
+      ["rows out", op.rows.toLocaleString()],
+      ["bytes out", `${fmtBytes(op.bytes)} (${op.bytes.toLocaleString()} B)`],
+      ...((op.inputs || []).length
+        ? [["inputs", op.inputs.map((i) => DATA.ops[i].name).join(", ")]]
+        : []),
+      ...((op.consumers || []).length
+        ? [["feeds", op.consumers.map((i) => DATA.ops[i].name).join(", ")]]
+        : []),
+    ],
+  };
+}
+function taskDetails(op, t) {
+  return {
+    title: `${op.name} · task ${t.idx}`,
+    rows: [
+      ["start", fmtS(t.s)],
+      ["end", fmtS(t.e)],
+      ["duration", fmtS(t.e - t.s)],
+      ...(t.cpu > 0 ? [["CPU time", fmtS(t.cpu)]] : []),
+      ["blocks", `${t.blocks}`],
+      ["rows", t.rows.toLocaleString()],
+      ["output", `${fmtBytes(t.bytes)} (${t.bytes.toLocaleString()} B)`],
+      ["node", String(t.node)],
+    ],
+  };
+}
+function detailsHtml(d) {
+  return `<div class="t">${d.title}</div>` +
+    d.rows.map(([k, v]) => `<div class="r"><span>${k}</span><span>${v}</span></div>`).join("");
+}
+
+function sparkline(op) {
+  const peak = Math.max(...op.counter.map((p) => p[1]), 1);
+  const w = 1000, h = 100;
+  const x = (t) => ((t - op.t0) / Math.max(op.t1 - op.t0, 1e-9)) * w;
+  const y = (n) => h - (n / peak) * (h - 12);
+  let d = `M 0 ${h}`, prevY = h;
+  for (const [t, n] of op.counter) {
+    d += ` L ${x(t).toFixed(1)} ${prevY.toFixed(1)} L ${x(t).toFixed(1)} ${y(n).toFixed(1)}`;
+    prevY = y(n);
+  }
+  d += ` L ${w} ${prevY.toFixed(1)} L ${w} ${h} Z`;
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><path d="${d}" fill="rgba(0,0,0,0.28)"/></svg>`;
+}
+
+function niceTicks() {
+  const span = v1 - v0;
+  const raw = span / 10;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 5, 10].map((m) => m * mag).find((s) => s >= raw) || mag;
+  const ticks = [];
+  for (let t = Math.ceil(v0 / step) * step; t <= v1 + 1e-12; t += step) ticks.push(t);
+  return ticks;
+}
+
+let rafPending = false;
+function reposition() {
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => {
+    rafPending = false;
+    const ticks = niceTicks();
+    // A label centered on an edge tick would be half-clipped and misread
+    // (e.g. "830s" shows as "0s"), so keep labels off the extreme edges.
+    document.getElementById("ticks").innerHTML = ticks.map((t) => {
+      const p = pctIn(t);
+      return p < 2 || p > 98
+        ? ""
+        : `<span class="tick" style="left:${p}%">${+t.toPrecision(6)}s</span>`;
+    }).join("");
+    document.getElementById("grid").innerHTML = ticks.map(
+      (t) => `<div class="gridline" style="left:${pctIn(t)}%"></div>`
+    ).join("");
+    for (const p of positioned) {
+      if (p.e < v0 || p.s > v1) { p.el.style.display = "none"; continue; }
+      p.el.style.display = "";
+      p.el.style.left = pctIn(p.s) + "%";
+      p.el.style.width = Math.max(pctIn(p.e) - pctIn(p.s), 0.08) + "%";
+    }
+  });
+}
+
+// Exposed for tests/automation.
+window.__setView = (a, b) => { v0 = a; v1 = b; reposition(); };
+
+// Focus mode: clicking a bar dims everything else and pins an inspector
+// panel with the full, copyable details. Click the same bar again, click
+// empty track space, press Escape, or hit ✕ to leave it.
+const inspector = document.getElementById("inspector");
+let focused = null;
+function clearFocus() {
+  if (!focused) return;
+  for (const el of focused.els) el.classList.remove("f-keep", "f-rel");
+  focused.el.classList.remove("f-keep");
+  document.querySelectorAll(".rel-in, .rel-out").forEach(
+    (el) => el.classList.remove("rel-in", "rel-out")
+  );
+  document.getElementById("rows").classList.remove("focus");
+  inspector.style.display = "none";
+  focused = null;
+}
+function setFocus(sel) {
+  if (dragged) return;  // a drag that ended on a bar is not a click
+  if (focused && focused.el === sel.el) { clearFocus(); return; }
+  clearFocus();
+  focused = sel;
+  document.getElementById("rows").classList.add("focus");
+  for (const el of sel.els) el.classList.add(sel.kind === "op" ? "f-keep" : "f-rel");
+  sel.el.classList.add("f-keep");
+  // Mark the focused operator's direct inputs and consumers on their labels.
+  for (const i of sel.op.inputs || [])
+    DATA.ops[i]._group?.querySelector(".oplabel")?.classList.add("rel-in");
+  for (const i of sel.op.consumers || [])
+    DATA.ops[i]._group?.querySelector(".oplabel")?.classList.add("rel-out");
+  const d = sel.kind === "op" ? opDetails(sel.op) : taskDetails(sel.op, sel.task);
+  inspector.innerHTML = detailsHtml(d) +
+    `<div class="btns"><button id="copybtn">copy</button><button id="closebtn">✕</button></div>`;
+  inspector.style.display = "block";
+  document.getElementById("closebtn").addEventListener("click", clearFocus);
+  document.getElementById("copybtn").addEventListener("click", async (ev) => {
+    const text = d.title + "\n" + d.rows.map(([k, v]) => `${k}: ${v}`).join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    ev.target.textContent = "copied";
+    setTimeout(() => (ev.target.textContent = "copy"), 1200);
+  });
+}
+window.addEventListener("keydown", (ev) => { if (ev.key === "Escape") clearFocus(); });
+chart.addEventListener("click", (ev) => {
+  if (dragged) return;
+  if (ev.target.classList.contains("optrack") || ev.target.classList.contains("lanes"))
+    clearFocus();
+});
+
+function setZoom(factor, anchorFrac) {
+  const span = v1 - v0;
+  const newSpan = Math.min(Math.max(span * factor, 1e-4), DATA.duration || 1);
+  const anchorT = v0 + anchorFrac * span;
+  v0 = anchorT - anchorFrac * newSpan;
+  v0 = Math.min(Math.max(v0, 0), (DATA.duration || 1) - newSpan);
+  v1 = v0 + newSpan;
+  reposition();
+}
+
+function render(data) {
+  clearFocus();  // a pinned inspector would reference the replaced DOM
+  DATA = data;
+  v0 = 0;
+  v1 = data.duration || 1;
+  positioned = [];
+  // Dependency structure: consumers from inputs, depth = hops from the sink,
+  // which drives plan-tree indentation of the labels.
+  for (const op of data.ops) op.consumers = [];
+  data.ops.forEach((op, i) => (op.inputs || []).forEach((j) => {
+    if (data.ops[j]) data.ops[j].consumers.push(i);
+  }));
+  const depthOf = (i, seen) => {
+    const op = data.ops[i];
+    if (op._depth !== undefined) return op._depth;
+    if (seen.has(i)) return 0;
+    seen.add(i);
+    op._depth = op.consumers.length
+      ? Math.min(...op.consumers.map((c) => depthOf(c, seen))) + 1
+      : 0;
+    return op._depth;
+  };
+  data.ops.forEach((_, i) => depthOf(i, new Set()));
+  const hasEdges = data.ops.some((op) => (op.inputs || []).length);
+  const nTasks = data.ops.reduce((a, o) => a + o.tasks.length, 0);
+  document.getElementById("meta").textContent =
+    (loadedName ? `${loadedName}: ` : "") +
+    `${fmtS(data.duration)} wall clock across ${data.ops.length} operators and ` +
+    `${nTasks} tasks. Click an operator to expand its tasks and a bar to ` +
+    "focus it; pinch or ctrl+scroll to zoom time, alt+scroll to zoom row " +
+    "heights, drag to pan, double-click to reset.";
+  document.getElementById("legend").innerHTML = Object.values(ROLES).map(
+    ([label, color]) => `<span><span class="swatch" style="background:${color}"></span>${label}</span>`
+  ).join("");
+
+  chart.innerHTML =
+    `<div class="axis"><div class="label-pad"></div><div class="ticks" id="ticks"></div></div>` +
+    `<div id="grid"></div><div id="rows"></div>` +
+    `<div id="cross"><div id="crossline"></div><div id="crosslabel"></div></div>`;
+  const rows = document.getElementById("rows");
+
+  for (const op of data.ops) {
+    const color = ROLES[op.role][1];
+    const group = document.createElement("div");
+    group.className = "oprow-group";
+
+    const row = document.createElement("div");
+    row.className = "oprow";
+    const indent = hasEdges ? Math.min(op._depth || 0, 18) * 9 : 0;
+    const guide = hasEdges && (op.consumers || []).length ? `<span class="guide">└ </span>` : "";
+    row.innerHTML =
+      `<div class="oplabel" title="${op.name}" style="padding-left:${12 + indent}px">` +
+      `<span class="chev">▸</span>${guide}${op.name}</div>` +
+      `<div class="optrack"></div>`;
+    op._group = group;
+    const opEls = [];
+    const bar = document.createElement("div");
+    bar.className = "opbar";
+    bar.style.background = color;
+    bar.innerHTML = sparkline(op);
+    bar.addEventListener("mousemove", (ev) => showTip(detailsHtml(opDetails(op)), ev));
+    bar.addEventListener("mouseleave", hideTip);
+    bar.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      setFocus({ kind: "op", op, el: bar, els: opEls });
+    });
+    row.querySelector(".optrack").appendChild(bar);
+    positioned.push({ el: bar, s: op.t0, e: op.t1 });
+    opEls.push(bar);
+    group.appendChild(row);
+
+    const lanesRow = document.createElement("div");
+    lanesRow.className = "oprow lanesrow";
+    const laneH = 11;
+    lanesRow.innerHTML =
+      `<div class="oplabel">${op.tasks.length} tasks · peak ${op.lanes}</div>` +
+      `<div class="lanes" style="height:calc(${op.lanes * laneH + 6}px * var(--vs))"></div>`;
+    const lanes = lanesRow.querySelector(".lanes");
+    for (const t of op.tasks) {
+      const el = document.createElement("div");
+      el.className = "task";
+      el.style.top = `calc(${3 + t.lane * laneH}px * var(--vs))`;
+      el.style.background = color;
+      el.addEventListener("mousemove", (ev) => showTip(detailsHtml(taskDetails(op, t)), ev));
+      el.addEventListener("mouseleave", hideTip);
+      el.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        setFocus({ kind: "task", op, task: t, el, els: opEls });
+      });
+      lanes.appendChild(el);
+      positioned.push({ el, s: t.s, e: t.e });
+      opEls.push(el);
+    }
+    group.appendChild(lanesRow);
+
+    row.querySelector(".oplabel").addEventListener("click", () =>
+      group.classList.toggle("open")
+    );
+    rows.appendChild(group);
+  }
+  reposition();
+}
+
+// A crosshair across every row follows the cursor, with the time under it.
+chart.addEventListener("pointermove", (ev) => {
+  const cross = document.getElementById("cross");
+  if (!DATA || !cross) return;
+  const rect = chart.getBoundingClientRect();
+  const x = ev.clientX - rect.left - LABELW;
+  const width = rect.width - LABELW;
+  if (x < 0 || x > width || ev.clientY - rect.top < 26) {
+    cross.style.display = "none";
+    return;
+  }
+  cross.style.display = "block";
+  const pos = (x / width) * 100 + "%";
+  document.getElementById("crossline").style.left = pos;
+  const label = document.getElementById("crosslabel");
+  label.style.left = pos;
+  label.textContent = fmtS(v0 + (x / width) * (v1 - v0));
+});
+chart.addEventListener("pointerleave", () => {
+  const cross = document.getElementById("cross");
+  if (cross) cross.style.display = "none";
+});
+
+// Pinch / ctrl+wheel zooms anchored at the cursor; a horizontal wheel pans;
+// a plain vertical wheel keeps scrolling the page. Dragging a track pans too.
+let vScale = 1;
+chart.addEventListener("wheel", (ev) => {
+  if (!DATA || !ev.target.closest("#rows, .ticks, #grid")) return;
+  if (ev.altKey) {
+    // alt+scroll zooms row heights (vertical zoom).
+    ev.preventDefault();
+    vScale = Math.min(Math.max(vScale * Math.exp(-ev.deltaY * 0.002), 0.35), 3);
+    chart.style.setProperty("--vs", vScale);
+  } else if (ev.ctrlKey || ev.metaKey) {
+    ev.preventDefault();
+    const rect = chart.getBoundingClientRect();
+    const frac = Math.min(Math.max((ev.clientX - rect.left - LABELW) / (rect.width - LABELW), 0), 1);
+    setZoom(Math.exp(ev.deltaY * 0.005), frac);
+  } else if (Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) {
+    ev.preventDefault();
+    const rect = chart.getBoundingClientRect();
+    const span = v1 - v0;
+    const dt = (ev.deltaX / (rect.width - LABELW)) * span;
+    v0 = Math.min(Math.max(v0 + dt, 0), (DATA.duration || 1) - span);
+    v1 = v0 + span;
+    reposition();
+  }
+}, { passive: false });
+
+let dragX = null, dragged = false;
+chart.addEventListener("pointerdown", (ev) => {
+  if (!DATA || !ev.target.closest(".optrack, .lanes")) return;
+  dragX = ev.clientX; dragged = false;
+});
+window.addEventListener("pointermove", (ev) => {
+  if (dragX === null) return;
+  const dx = ev.clientX - dragX;
+  if (Math.abs(dx) < 3 && !dragged) return;
+  dragged = true;
+  dragX = ev.clientX;
+  const rect = chart.getBoundingClientRect();
+  const dt = (-dx / (rect.width - LABELW)) * (v1 - v0);
+  const span = v1 - v0;
+  v0 = Math.min(Math.max(v0 + dt, 0), (DATA.duration || 1) - span);
+  v1 = v0 + span;
+  reposition();
+});
+window.addEventListener("pointerup", () => (dragX = null));
+chart.addEventListener("dblclick", () => {
+  if (!DATA) return;
+  v0 = 0; v1 = DATA.duration || 1;
+  reposition();
+});
+
+// Load a trace via the Open button, the empty-state click, or drag and drop
+// (gzipped traces decompress natively).
+let loadedName = null;
+async function loadFile(file) {
+  let stream = file.stream();
+  if (file.name.endsWith(".gz")) stream = stream.pipeThrough(new DecompressionStream("gzip"));
+  const text = await new Response(stream).text();
+  const data = normalize(JSON.parse(text));
+  if (data && data.ops.length) {
+    loadedName = file.name;
+    render(data);
+  }
+}
+const fileInput = document.getElementById("fileinput");
+fileInput.addEventListener("change", () => {
+  if (fileInput.files[0]) loadFile(fileInput.files[0]);
+  fileInput.value = "";
+});
+document.getElementById("openbtn").addEventListener("click", () => fileInput.click());
+chart.addEventListener("click", (ev) => {
+  if (ev.target.id === "empty") fileInput.click();
+});
+chart.addEventListener("dragover", (ev) => { ev.preventDefault(); chart.classList.add("dropping"); });
+chart.addEventListener("dragleave", () => chart.classList.remove("dropping"));
+chart.addEventListener("drop", (ev) => {
+  ev.preventDefault();
+  chart.classList.remove("dropping");
+  const f = ev.dataTransfer.files[0];
+  if (f) loadFile(f);
+});
+
+const initial = normalize(EMBEDDED);
+if (initial && initial.ops.length) render(initial);
+</script>
+</body>
+</html>
