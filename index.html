@@ -138,6 +138,12 @@
   }
   #inspector button:hover { color: var(--ink); }
   .oplabel .guide { color: var(--ink-3); }
+  #rails {
+    position: absolute; top: 0; left: 0; z-index: 2; pointer-events: none;
+    overflow: visible;
+  }
+  #rails path { fill: none; stroke: var(--ink-3); stroke-opacity: 0.45; stroke-width: 1.5; }
+  #rails path.rail-focus { stroke: var(--ink); stroke-opacity: 0.9; stroke-width: 2; }
   /* Focused operator's direct relations: inputs dashed, consumers solid. */
   .oplabel.rel-in { box-shadow: inset 3px 0 var(--ink-3); }
   .oplabel.rel-out { box-shadow: inset 3px 0 var(--ink); }
@@ -368,6 +374,7 @@ function clearFocus() {
   document.getElementById("rows").classList.remove("focus");
   inspector.style.display = "none";
   focused = null;
+  applyRailFocus();
 }
 function setFocus(sel) {
   if (dragged) return;  // a drag that ended on a bar is not a click
@@ -382,6 +389,7 @@ function setFocus(sel) {
     DATA.ops[i]._group?.querySelector(".oplabel")?.classList.add("rel-in");
   for (const i of sel.op.consumers || [])
     DATA.ops[i]._group?.querySelector(".oplabel")?.classList.add("rel-out");
+  applyRailFocus();
   const d = sel.kind === "op" ? opDetails(sel.op) : taskDetails(sel.op, sel.task);
   inspector.innerHTML = detailsHtml(d) +
     `<div class="btns"><button id="copybtn">copy</button><button id="closebtn">✕</button></div>`;
@@ -458,6 +466,7 @@ function render(data) {
   chart.innerHTML =
     `<div class="axis"><div class="label-pad"></div><div class="ticks" id="ticks"></div></div>` +
     `<div id="grid"></div><div id="rows"></div>` +
+    `<svg id="rails"></svg>` +
     `<div id="cross"><div id="crossline"></div><div id="crosslabel"></div></div>`;
   const rows = document.getElementById("rows");
 
@@ -469,10 +478,9 @@ function render(data) {
     const row = document.createElement("div");
     row.className = "oprow";
     const indent = hasEdges ? Math.min(op._depth || 0, 18) * 9 : 0;
-    const guide = hasEdges && (op.consumers || []).length ? `<span class="guide">└ </span>` : "";
     row.innerHTML =
-      `<div class="oplabel" title="${op.name}" style="padding-left:${12 + indent}px">` +
-      `<span class="chev">▸</span>${guide}${op.name}</div>` +
+      `<div class="oplabel" title="${op.name}" style="padding-left:${14 + indent}px">` +
+      `<span class="chev">▸</span>${op.name}</div>` +
       `<div class="optrack"></div>`;
     op._group = group;
     const opEls = [];
@@ -515,12 +523,14 @@ function render(data) {
     }
     group.appendChild(lanesRow);
 
-    row.querySelector(".oplabel").addEventListener("click", () =>
-      group.classList.toggle("open")
-    );
+    row.querySelector(".oplabel").addEventListener("click", () => {
+      group.classList.toggle("open");
+      drawRails();
+    });
     rows.appendChild(group);
   }
   reposition();
+  drawRails();
 }
 
 // A crosshair across every row follows the cursor, with the time under it.
@@ -546,6 +556,48 @@ chart.addEventListener("pointerleave", () => {
   if (cross) cross.style.display = "none";
 });
 
+// Dependency rails: an elbow from each operator's row down to its consumer's
+// row, drawn in the label gutter (git-log --graph style). Row order is
+// post-order (inputs above consumers), so edges always point downward.
+function drawRails() {
+  const rails = document.getElementById("rails");
+  const rows = document.getElementById("rows");
+  if (!rails || !rows || !DATA) return;
+  const chartTop = chart.getBoundingClientRect().top;
+  const h = rows.offsetTop + rows.offsetHeight;
+  rails.setAttribute("width", LABELW);
+  rails.setAttribute("height", h);
+  rails.style.height = h + "px";
+  rails.style.width = LABELW + "px";
+  const yOf = (op) => {
+    const r = op._group.querySelector(".oprow").getBoundingClientRect();
+    return r.top - chartTop + r.height / 2;
+  };
+  const xOf = (op) => 8 + Math.min(op._depth || 0, 18) * 9;
+  let d = [];
+  for (const op of DATA.ops) {
+    for (const ci of op.consumers || []) {
+      const c = DATA.ops[ci];
+      if (!c) continue;
+      const x1 = xOf(op), y1 = yOf(op), y2 = yOf(c), x2 = xOf(c) + 4;
+      d.push(
+        `<path data-from="${DATA.ops.indexOf(op)}" data-to="${ci}" ` +
+        `d="M ${x1} ${y1 + 7} V ${y2 - 5} Q ${x1} ${y2} ${x1 - 5} ${y2} H ${x2}"/>`
+      );
+    }
+  }
+  rails.innerHTML = d.join("");
+  applyRailFocus();
+}
+function applyRailFocus() {
+  const idx = focused && focused.kind === "op" ? DATA.ops.indexOf(focused.op) : -1;
+  document.querySelectorAll("#rails path").forEach((p) => {
+    const on = idx >= 0 && (+p.dataset.from === idx || +p.dataset.to === idx);
+    p.classList.toggle("rail-focus", on);
+  });
+}
+new ResizeObserver(() => drawRails()).observe(document.body);
+
 // Pinch / ctrl+wheel zooms anchored at the cursor; a horizontal wheel pans;
 // a plain vertical wheel keeps scrolling the page. Dragging a track pans too.
 let vScale = 1;
@@ -556,6 +608,7 @@ chart.addEventListener("wheel", (ev) => {
     ev.preventDefault();
     vScale = Math.min(Math.max(vScale * Math.exp(-ev.deltaY * 0.002), 0.35), 3);
     chart.style.setProperty("--vs", vScale);
+    drawRails();
   } else if (ev.ctrlKey || ev.metaKey) {
     ev.preventDefault();
     const rect = chart.getBoundingClientRect();
