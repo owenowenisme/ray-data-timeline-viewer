@@ -434,23 +434,30 @@ function render(data) {
   v0 = 0;
   v1 = data.duration || 1;
   positioned = [];
-  // Dependency structure: consumers from inputs, depth = hops from the sink,
-  // which drives plan-tree indentation of the labels.
+  // Dependency structure: consumers from inputs. Indentation counts BRANCH
+  // points, not chain hops: at each consumer, the input with the largest
+  // upstream subtree continues the spine at the same indent, and every other
+  // input steps one level right. A deep linear pipeline therefore stays
+  // flush while side inputs hang off it, git-log --graph style.
   for (const op of data.ops) op.consumers = [];
   data.ops.forEach((op, i) => (op.inputs || []).forEach((j) => {
     if (data.ops[j]) data.ops[j].consumers.push(i);
   }));
-  const depthOf = (i, seen) => {
+  const subtree = new Array(data.ops.length).fill(0);
+  data.ops.forEach((op, i) => {  // post-order: inputs come before consumers
+    subtree[i] = 1 + (op.inputs || []).reduce((a, j) => a + (subtree[j] || 0), 0);
+  });
+  for (let i = data.ops.length - 1; i >= 0; i--) {  // consumers first
     const op = data.ops[i];
-    if (op._depth !== undefined) return op._depth;
-    if (seen.has(i)) return 0;
-    seen.add(i);
-    op._depth = op.consumers.length
-      ? Math.min(...op.consumers.map((c) => depthOf(c, seen))) + 1
-      : 0;
-    return op._depth;
-  };
-  data.ops.forEach((_, i) => depthOf(i, new Set()));
+    const c = (op.consumers || [])[0];
+    if (c === undefined) {
+      op._depth = 0;
+      continue;
+    }
+    const siblings = data.ops[c].inputs || [];
+    const primary = siblings.reduce((a, b) => (subtree[b] > subtree[a] ? b : a), siblings[0]);
+    op._depth = (data.ops[c]._depth || 0) + (i === primary ? 0 : 1);
+  }
   const hasEdges = data.ops.some((op) => (op.inputs || []).length);
   const nTasks = data.ops.reduce((a, o) => a + o.tasks.length, 0);
   document.getElementById("meta").textContent =
@@ -477,7 +484,7 @@ function render(data) {
 
     const row = document.createElement("div");
     row.className = "oprow";
-    const indent = hasEdges ? Math.min(op._depth || 0, 18) * 9 : 0;
+    const indent = hasEdges ? Math.min(op._depth || 0, 10) * 16 : 0;
     row.innerHTML =
       `<div class="oplabel" title="${op.name}" style="padding-left:${14 + indent}px">` +
       `<span class="chev">▸</span>${op.name}</div>` +
@@ -573,7 +580,7 @@ function drawRails() {
     const r = op._group.querySelector(".oprow").getBoundingClientRect();
     return r.top - chartTop + r.height / 2;
   };
-  const xOf = (op) => 8 + Math.min(op._depth || 0, 18) * 9;
+  const xOf = (op) => 8 + Math.min(op._depth || 0, 10) * 16;
   let d = [];
   for (const op of DATA.ops) {
     for (const ci of op.consumers || []) {
