@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ray-data-timeline"
+version = "0.1.0"
+description = "Execution-timeline exporter for Ray Data: per-operator task Gantt, running-task counters, and failed task attempts as a Chrome trace, with no Ray modifications."
+readme = "README.md"
+requires-python = ">=3.9"
+# ray is intentionally not a dependency: this runs inside an existing Ray
+# environment and must never pull a second ray into it.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/owenowenisme/ray-data-timeline-viewer"
+
+[tool.setuptools]
+packages = ["ray_data_timeline"]

@@ -1,0 +1,5 @@
+ray-data-timeline @ git+https://github.com/owenowenisme/ray-data-timeline-viewer.git
+# polars + pyarrow are only needed if your pipeline uses Dataset.join or
+# expression UDFs; drop them otherwise.
+polars
+pyarrow

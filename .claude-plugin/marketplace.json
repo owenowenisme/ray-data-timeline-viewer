@@ -1,0 +1,14 @@
+{
+  "name": "ray-data-timeline-tools",
+  "owner": {
+    "name": "You-Cheng Lin"
+  },
+  "description": "Tooling for the unmerged Ray Data timeline feature (Dataset.export_timeline): profile pipelines on Anyscale and render execution timelines.",
+  "plugins": [
+    {
+      "name": "ray-data-timeline-profiling",
+      "source": "./timeline-profiling-plugin",
+      "description": "Profile a Ray Data pipeline on an Anyscale cluster and render its execution timeline, patching the unmerged timeline branch onto a stock nightly image."
+    }
+  ]
+}
