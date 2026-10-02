@@ -328,6 +328,15 @@ def _failed_attempts_from_events(
     for t in tasks:
         if t.state != "FAILED":
             continue
+        # Skip actor-creation "failures": when Ray Data tears down a pool of
+        # actors at end of use (e.g. the Parquet FooterReader actors, or an
+        # actor-pool map_batches), it re-stamps each actor's completed
+        # __init__ task as FAILED/WORKER_DIED with a nil task id and no node.
+        # That is normal teardown, not a task that failed and retried, so it
+        # would be one spurious "failure" per actor on every job. Genuine
+        # retriable failures are normal tasks and actor *method* calls.
+        if getattr(t, "type", "NORMAL_TASK") == "ACTOR_CREATION_TASK":
+            continue
         # A worker that dies early can be gone before it flushes the RUNNING
         # transition, leaving start_time_ms unset; fall back to the creation
         # time (includes queueing) rather than dropping the attempt.
