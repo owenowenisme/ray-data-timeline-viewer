@@ -300,29 +300,52 @@ def _fetch_job_task_events() -> Optional[List[Any]]:
     Task events in GCS are bounded (``RAY_task_events_max_num_task_in_gcs``),
     so on very large runs old attempts may already be evicted.
     """
+    # The state-API server rejects a limit above its own cap (default 10000,
+    # raised cluster-side by RAY_MAX_LIMIT_FROM_API_SERVER) with a HARD error,
+    # not a truncation — so overshooting disables the whole state-API path.
+    # Default to the server cap; honor a higher RAY_DATA_TIMELINE_MAX_TASKS
+    # only when the cluster also raised its server cap, and fall back to 10000
+    # if the server rejects the higher value.
+    SERVER_DEFAULT_CAP = 10_000
     try:
         import os
 
         import ray
         from ray.util.state.api import list_tasks
 
-        # Large runs blow past the default cap; raise it (and warn on hitting
-        # it) so failed-attempt capture and shuffle-span backfill stay
-        # complete. GCS still bounds retained events
-        # (RAY_task_events_max_num_task_in_gcs), so a huge run may evict
-        # regardless.
-        limit = int(os.environ.get("RAY_DATA_TIMELINE_MAX_TASKS", "500000"))
-        job_id = ray.runtime_context.get_runtime_context().get_job_id()
-        rows = list_tasks(
-            detail=True,
-            limit=limit,
-            raise_on_missing_output=False,
-            filters=[("job_id", "=", job_id)],
+        limit = int(
+            os.environ.get("RAY_DATA_TIMELINE_MAX_TASKS", str(SERVER_DEFAULT_CAP))
         )
+        job_id = ray.runtime_context.get_runtime_context().get_job_id()
+
+        def fetch(lim):
+            return list_tasks(
+                detail=True,
+                limit=lim,
+                raise_on_missing_output=False,
+                filters=[("job_id", "=", job_id)],
+            )
+
+        try:
+            rows = fetch(limit)
+        except Exception as e:
+            if "exceeds the supported limit" in str(e) and limit > SERVER_DEFAULT_CAP:
+                logger.warning(
+                    "Requested task limit %d exceeds the state-API server cap; "
+                    "falling back to %d. To capture more, set "
+                    "RAY_MAX_LIMIT_FROM_API_SERVER on the cluster.",
+                    limit,
+                    SERVER_DEFAULT_CAP,
+                )
+                limit = SERVER_DEFAULT_CAP
+                rows = fetch(limit)
+            else:
+                raise
         if len(rows) >= limit:
             logger.warning(
                 "Hit the state-API task cap (%d); failed attempts and shuffle "
-                "backfill may be incomplete. Raise RAY_DATA_TIMELINE_MAX_TASKS.",
+                "backfill may be incomplete. Raise RAY_DATA_TIMELINE_MAX_TASKS "
+                "(and RAY_MAX_LIMIT_FROM_API_SERVER on the cluster).",
                 limit,
             )
         return rows
