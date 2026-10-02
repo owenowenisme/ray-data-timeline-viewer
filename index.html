@@ -12,6 +12,7 @@
     --hairline: #e4e3de; --grid: #ecebe6;
     --c-read: #2a78d6; --c-transform: #eb6834; --c-shufmap: #1baf7a;
     --c-shufreduce: #e87ba4; --c-output: #eda100;
+    --fail: #e34948;
     --tooltip-bg: #1f1f1d; --tooltip-ink: #f5f4ef;
   }
   @media (prefers-color-scheme: dark) {
@@ -21,6 +22,7 @@
       --hairline: #333330; --grid: #262624;
       --c-read: #3987e5; --c-transform: #d95926; --c-shufmap: #199e70;
       --c-shufreduce: #d55181; --c-output: #c98500;
+      --fail: #e66767;
       --tooltip-bg: #f5f4ef; --tooltip-ink: #1f1f1d;
     }
   }
@@ -90,6 +92,15 @@
   .lanes { position: relative; flex: 1; overflow: hidden; cursor: grab; }
   .task { position: absolute; height: calc(9px * var(--vs)); border-radius: 2px; min-width: 1.5px; }
   .task:hover { outline: 1px solid var(--ink); }
+  /* Failed attempt bars: red + diagonal stripes so they read without color. */
+  .task.failed {
+    background: var(--fail) !important;
+    background-image: repeating-linear-gradient(
+      45deg, transparent 0 3px, rgba(255, 255, 255, 0.5) 3px 6px) !important;
+  }
+  .failbadge {
+    color: var(--fail); font-weight: 700; font-size: 11px; margin-left: 7px;
+  }
 
   #tooltip {
     position: fixed; display: none; z-index: 10; pointer-events: none;
@@ -203,23 +214,25 @@ function normalize(raw) {
   if (raw.ops) return raw;
   const evs = raw.traceEvents || (Array.isArray(raw) ? raw : null);
   if (!evs) return null;
-  const names = {}, tasks = {}, counters = {}, edges = {};
+  const names = {}, tasks = {}, failed = {}, counters = {}, edges = {};
   for (const e of evs) {
     if (e.name === "process_name") names[e.pid] = e.args.name;
   }
   for (const e of evs) {
     if (e.ph === "X" && e.cat === "task") (tasks[e.pid] = tasks[e.pid] || []).push(e);
+    else if (e.ph === "X" && e.cat === "failed_task")
+      (failed[e.pid] = failed[e.pid] || []).push(e);
     else if (e.ph === "X" && e.cat === "operator") edges[e.pid] = e.args.input_ops || [];
     else if (e.ph === "C" && e.name === "running tasks")
       (counters[e.pid] = counters[e.pid] || []).push([e.ts / 1e6, e.args.tasks]);
   }
   const keptPids = Object.keys(names).map(Number).sort((a, b) => a - b)
-    .filter((pid) => names[pid] !== "all operators" && tasks[pid]);
+    .filter((pid) => names[pid] !== "all operators" && (tasks[pid] || failed[pid]));
   const pidToIdx = Object.fromEntries(keptPids.map((pid, i) => [pid, i]));
   const ops = [];
   for (const pid of keptPids) {
     const name = names[pid].replace(/^\d+: /, "");
-    const ts = tasks[pid].map((e) => ({
+    const ts = (tasks[pid] || []).map((e) => ({
       idx: parseInt(e.name.split(" ").pop(), 10),
       lane: e.tid,
       s: e.ts / 1e6,
@@ -230,19 +243,34 @@ function normalize(raw) {
       cpu: e.args.cpu_s || 0,
       node: e.args.node_id,
     }));
+    // Failed attempts sit in trace tids after the success lanes; rebase them
+    // to lane 0 so the viewer can stack them under the success lanes.
+    const nLanes = ts.length ? Math.max(...ts.map((t) => t.lane)) + 1 : 0;
+    const fts = (failed[pid] || []).map((e) => ({
+      attempt: parseInt(e.name.split(" ").pop(), 10),
+      lane: Math.max(e.tid - nLanes, 0),
+      s: e.ts / 1e6,
+      e: (e.ts + e.dur) / 1e6,
+      error: e.args.error_type,
+      taskName: e.args.task_name,
+      node: e.args.node_id,
+    }));
+    const spans = [...ts, ...fts];
     ops.push({
       name,
       role: roleOf(name),
       inputs: (edges[pid] || []).map((p) => pidToIdx[p]).filter((i) => i !== undefined),
-      t0: Math.min(...ts.map((t) => t.s)),
-      t1: Math.max(...ts.map((t) => t.e)),
+      t0: Math.min(...spans.map((t) => t.s)),
+      t1: Math.max(...spans.map((t) => t.e)),
       busy: ts.reduce((a, t) => a + (t.e - t.s), 0),
       cpu: ts.reduce((a, t) => a + t.cpu, 0),
       rows: ts.reduce((a, t) => a + t.rows, 0),
       bytes: ts.reduce((a, t) => a + t.bytes, 0),
-      lanes: Math.max(...ts.map((t) => t.lane)) + 1,
+      lanes: nLanes,
+      flanes: fts.length ? Math.max(...fts.map((t) => t.lane)) + 1 : 0,
       counter: (counters[pid] || []).sort((a, b) => a[0] - b[0]),
       tasks: ts,
+      failed: fts,
     });
   }
   return { ops, duration: Math.max(...ops.map((o) => o.t1), 0) };
@@ -278,6 +306,7 @@ function opDetails(op) {
     rows: [
       ["span", `${fmtS(op.t0)} – ${fmtS(op.t1)} (${fmtS(op.t1 - op.t0)})`],
       ["tasks", `${op.tasks.length}`],
+      ...((op.failed || []).length ? [["failed attempts", `${op.failed.length}`]] : []),
       ["peak running", `${peak}`],
       ["task-busy", fmtS(op.busy)],
       ...(op.cpu > 0
@@ -306,6 +335,19 @@ function taskDetails(op, t) {
       ["rows", t.rows.toLocaleString()],
       ["output", `${fmtBytes(t.bytes)} (${t.bytes.toLocaleString()} B)`],
       ["node", String(t.node)],
+    ],
+  };
+}
+function failedDetails(op, f) {
+  return {
+    title: `${op.name} · FAILED attempt ${f.attempt}`,
+    rows: [
+      ["start", fmtS(f.s)],
+      ["end", fmtS(f.e)],
+      ["duration", fmtS(f.e - f.s)],
+      ["error", String(f.error)],
+      ["task name", String(f.taskName)],
+      ["node", String(f.node)],
     ],
   };
 }
@@ -399,7 +441,9 @@ function setFocus(sel) {
   for (const i of sel.op.consumers || [])
     DATA.ops[i]._group?.querySelector(".oplabel")?.classList.add("rel-out");
   applyRailFocus();
-  const d = sel.kind === "op" ? opDetails(sel.op) : taskDetails(sel.op, sel.task);
+  const d = sel.kind === "op" ? opDetails(sel.op)
+    : sel.failed ? failedDetails(sel.op, sel.task)
+    : taskDetails(sel.op, sel.task);
   inspector.innerHTML = detailsHtml(d) +
     `<div class="btns"><button id="copybtn">copy</button><button id="closebtn">✕</button></div>`;
   inspector.style.display = "block";
@@ -525,7 +569,8 @@ function render(data) {
     const indent = hasEdges ? Math.min(op._depth || 0, 10) * 16 : 0;
     row.innerHTML =
       `<div class="oplabel" title="${op.name}" style="padding-left:${22 + indent}px">` +
-      `${hasEdges ? stripHtml(op) : ""}<span class="chev">▸</span>${op.name}</div>` +
+      `${hasEdges ? stripHtml(op) : ""}<span class="chev">▸</span>${op.name}` +
+      `${(op.failed || []).length ? `<span class="failbadge">✗ ${op.failed.length}</span>` : ""}</div>` +
       `<div class="optrack"></div>`;
     op._group = group;
     const opEls = [];
@@ -547,10 +592,13 @@ function render(data) {
     const lanesRow = document.createElement("div");
     lanesRow.className = "oprow lanesrow";
     const laneH = 11;
+    const failedTs = op.failed || [];
+    const flanes = op.flanes || 0;
     lanesRow.innerHTML =
       `<div class="oplabel" style="padding-left:${22 + indent}px">` +
-      `${hasEdges ? stripHtml(op) : ""}${op.tasks.length} tasks · peak ${op.lanes}</div>` +
-      `<div class="lanes" style="height:calc(${op.lanes * laneH + 6}px * var(--vs))"></div>`;
+      `${hasEdges ? stripHtml(op) : ""}${op.tasks.length} tasks · peak ${op.lanes}` +
+      `${failedTs.length ? `<span class="failbadge">✗ ${failedTs.length} failed</span>` : ""}</div>` +
+      `<div class="lanes" style="height:calc(${(op.lanes + flanes) * laneH + 6}px * var(--vs))"></div>`;
     const lanes = lanesRow.querySelector(".lanes");
     for (const t of op.tasks) {
       const el = document.createElement("div");
@@ -565,6 +613,20 @@ function render(data) {
       });
       lanes.appendChild(el);
       positioned.push({ el, s: t.s, e: t.e });
+      opEls.push(el);
+    }
+    for (const f of failedTs) {
+      const el = document.createElement("div");
+      el.className = "task failed";
+      el.style.top = `calc(${3 + (op.lanes + f.lane) * laneH}px * var(--vs))`;
+      el.addEventListener("mousemove", (ev) => showTip(detailsHtml(failedDetails(op, f)), ev));
+      el.addEventListener("mouseleave", hideTip);
+      el.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        setFocus({ kind: "task", op, task: f, el, els: opEls, failed: true });
+      });
+      lanes.appendChild(el);
+      positioned.push({ el, s: f.s, e: f.e });
       opEls.push(el);
     }
     group.appendChild(lanesRow);
