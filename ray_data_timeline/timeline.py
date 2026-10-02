@@ -394,6 +394,34 @@ def _estimate_node_offsets(
     return {n: epoch_min[n] - m for n, m in mono_min.items() if n in epoch_min}
 
 
+def _split_by_time_gaps(rows: List[Any], k: int) -> List[List[Any]]:
+    """Split time-sorted ``rows`` into ``k`` contiguous groups at the largest
+    gaps between consecutive start times.
+
+    Used to divide the state-API tasks that share an operator name among the
+    ``k`` distinct operators carrying that name. Same-named operators in a
+    query are shuffle stages of a join chain, which run sequentially, so the
+    k-1 widest start-time gaps separate one stage's tasks from the next.
+    Always returns exactly ``k`` lists (some may be empty when there are fewer
+    than ``k`` tasks or fewer distinct time clusters).
+    """
+    if k <= 1:
+        return [rows]
+    if len(rows) <= k:
+        return [[r] for r in rows] + [[] for _ in range(k - len(rows))]
+    starts = [r.start_time_ms for r in rows]
+    gaps = sorted(
+        range(1, len(rows)), key=lambda i: starts[i] - starts[i - 1], reverse=True
+    )
+    cut_points = sorted(gaps[: k - 1])
+    groups, prev = [], 0
+    for cut in cut_points:
+        groups.append(rows[prev:cut])
+        prev = cut
+    groups.append(rows[prev:])
+    return groups
+
+
 def _backfill_empty_operators(
     per_op: List[Tuple[str, List[TaskInterval]]], tasks: List[Any]
 ) -> int:
@@ -407,15 +435,23 @@ def _backfill_empty_operators(
     Mutates ``per_op`` in place; returns the number of operators filled.
     Spans only: rows/bytes/CPU are unknown to the state API.
 
-    Longest-matching-operator assignment prevents a fused parent name
-    ("A->B") from also claiming tasks named after its sub-operator "B".
+    Two name hazards, both real on TPC-H:
+
+    - **Exact match, not substring.** A task is assigned to an operator only
+      when its name equals the operator name. Substring matching would let a
+      phantom "ReadFiles" stats-root operator claim "ReadFilesParquetV2->
+      Project" read tasks.
+    - **Repeated names.** A multi-join query has several operators all named
+      e.g. "JoinShuffleReduce(num_partitions=200)->Project"; the state API
+      can't say which instance a task belongs to. Tasks for one name are
+      split across its operators by start-time gaps (the stages run in
+      sequence), so each instance gets its own tasks instead of all of them.
     """
-    empty = {name for name, ivs in per_op if not ivs}
-    if not empty:
+    empty_names = {name for name, ivs in per_op if not ivs and name}
+    if not empty_names:
         return 0
-    matched: Dict[str, List[Any]] = {name: [] for name in empty}
+    by_name: Dict[str, List[Any]] = {name: [] for name in empty_names}
     for t in tasks:
-        name = t.name or ""
         if (
             t.state != "FINISHED"
             or getattr(t, "type", "NORMAL_TASK") != "NORMAL_TASK"
@@ -423,34 +459,38 @@ def _backfill_empty_operators(
             or t.end_time_ms is None
         ):
             continue
-        hits = [op for op in empty if op and op in name]
-        if hits:
-            matched[max(hits, key=len)].append(t)
+        if t.name in by_name:
+            by_name[t.name].append(t)
+
+    def make_intervals(name, rows):
+        return [
+            TaskInterval(
+                operator=name,
+                task_idx=idx,
+                node_id=t.node_id,
+                start_s=t.start_time_ms / 1000,
+                end_s=t.end_time_ms / 1000,
+                cpu_s=0.0,
+                num_blocks=0,
+                num_rows=0,
+                size_bytes=0,
+            )
+            for idx, t in enumerate(rows)
+        ]
 
     filled = 0
-    for i, (name, ivs) in enumerate(per_op):
-        rows = matched.get(name)
-        if ivs or not rows:
+    for name, rows in by_name.items():
+        if not rows:
             continue
         rows.sort(key=lambda t: t.start_time_ms)
-        per_op[i] = (
-            name,
-            [
-                TaskInterval(
-                    operator=name,
-                    task_idx=idx,
-                    node_id=t.node_id,
-                    start_s=t.start_time_ms / 1000,
-                    end_s=t.end_time_ms / 1000,
-                    cpu_s=0.0,
-                    num_blocks=0,
-                    num_rows=0,
-                    size_bytes=0,
-                )
-                for idx, t in enumerate(rows)
-            ],
-        )
-        filled += 1
+        # Empty operators carrying this name, in topological (execution) order.
+        op_indices = [
+            i for i, (n, ivs) in enumerate(per_op) if n == name and not ivs
+        ]
+        for op_i, group in zip(op_indices, _split_by_time_gaps(rows, len(op_indices))):
+            if group:
+                per_op[op_i] = (name, make_intervals(name, group))
+                filled += 1
     return filled
 
 
