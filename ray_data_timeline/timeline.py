@@ -301,16 +301,31 @@ def _fetch_job_task_events() -> Optional[List[Any]]:
     so on very large runs old attempts may already be evicted.
     """
     try:
+        import os
+
         import ray
         from ray.util.state.api import list_tasks
 
+        # Large runs blow past the default cap; raise it (and warn on hitting
+        # it) so failed-attempt capture and shuffle-span backfill stay
+        # complete. GCS still bounds retained events
+        # (RAY_task_events_max_num_task_in_gcs), so a huge run may evict
+        # regardless.
+        limit = int(os.environ.get("RAY_DATA_TIMELINE_MAX_TASKS", "500000"))
         job_id = ray.runtime_context.get_runtime_context().get_job_id()
-        return list_tasks(
+        rows = list_tasks(
             detail=True,
-            limit=10_000,
+            limit=limit,
             raise_on_missing_output=False,
             filters=[("job_id", "=", job_id)],
         )
+        if len(rows) >= limit:
+            logger.warning(
+                "Hit the state-API task cap (%d); failed attempts and shuffle "
+                "backfill may be incomplete. Raise RAY_DATA_TIMELINE_MAX_TASKS.",
+                limit,
+            )
+        return rows
     except Exception as e:
         logger.warning(
             "Ray state API unavailable; failed task attempts, stock-Ray clock "
