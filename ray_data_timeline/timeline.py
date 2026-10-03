@@ -301,11 +301,13 @@ def _fetch_job_task_events() -> Optional[List[Any]]:
     so on very large runs old attempts may already be evicted.
     """
     # The state-API server rejects a limit above its own cap (default 10000,
-    # raised cluster-side by RAY_MAX_LIMIT_FROM_API_SERVER) with a HARD error,
-    # not a truncation — so overshooting disables the whole state-API path.
-    # Default to the server cap; honor a higher RAY_DATA_TIMELINE_MAX_TASKS
-    # only when the cluster also raised its server cap, and fall back to 10000
-    # if the server rejects the higher value.
+    # raised by RAY_MAX_LIMIT_FROM_API_SERVER) with a HARD error, not a
+    # truncation — so overshooting disables the whole state-API path. Request
+    # exactly the server's own cap by reading the SAME env var the dashboard
+    # reads, so raising RAY_MAX_LIMIT_FROM_API_SERVER alone lifts both the
+    # server limit and how much we ask for — one knob. RAY_DATA_TIMELINE_MAX_TASKS
+    # still overrides if someone wants to request less. Fall back to 10000 if
+    # the server rejects the request anyway.
     SERVER_DEFAULT_CAP = 10_000
     try:
         import os
@@ -313,9 +315,10 @@ def _fetch_job_task_events() -> Optional[List[Any]]:
         import ray
         from ray.util.state.api import list_tasks
 
-        limit = int(
-            os.environ.get("RAY_DATA_TIMELINE_MAX_TASKS", str(SERVER_DEFAULT_CAP))
+        server_cap = os.environ.get(
+            "RAY_MAX_LIMIT_FROM_API_SERVER", str(SERVER_DEFAULT_CAP)
         )
+        limit = int(os.environ.get("RAY_DATA_TIMELINE_MAX_TASKS", server_cap))
         job_id = ray.runtime_context.get_runtime_context().get_job_id()
 
         def fetch(lim):
